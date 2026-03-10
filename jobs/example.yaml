@@ -1,0 +1,12 @@
+name: system-info
+
+steps:
+  - name: check OS and kernel
+    run: |
+      cat /etc/os-release | grep PRETTY_NAME
+      uname -r
+
+  - name: check openssl
+    run: |
+      openssl version
+      rpm -q openssl

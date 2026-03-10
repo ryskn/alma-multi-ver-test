@@ -1,0 +1,15 @@
+# Binaries
+agent/alma-agent
+controller/alma-ctl
+
+# Generated protobuf
+proto/*.pb.go
+
+# Vagrant
+.vagrant/
+
+# RPM files
+*.rpm
+
+# Go
+vendor/

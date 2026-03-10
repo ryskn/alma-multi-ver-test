@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package alma;
+
+option go_package = "github.com/ryosuke/alma/proto";
+
+// Agent runs inside each Vagrant VM.
+service Agent {
+  // Execute a shell script and return the result.
+  rpc ExecScript(ExecRequest) returns (ExecResponse);
+  // Upload a file or tar archive to the VM.
+  rpc Upload(stream UploadChunk) returns (UploadResponse);
+  // Check agent health.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message ExecRequest {
+  string script_name = 1;
+  string script_body = 2;
+}
+
+message ExecResponse {
+  int32  exit_code = 1;
+  string stdout    = 2;
+  string stderr    = 3;
+}
+
+message PingRequest {}
+
+message PingResponse {
+  string hostname = 1;
+  string os_info  = 2;
+}
+
+message UploadChunk {
+  string dest_path = 1;  // destination path on the VM (set in first chunk)
+  bytes  data      = 2;  // file/tar content chunk
+  bool   is_tar    = 3;  // if true, extract as tar archive at dest_path
+}
+
+message UploadResponse {
+  int64 bytes_written = 1;
+}

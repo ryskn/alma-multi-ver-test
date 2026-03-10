@@ -1,0 +1,48 @@
+name: build-vagrant-libvirt
+
+vars:
+  alma8:
+    branch: el8
+  alma9:
+    branch: el9
+  alma10:
+    branch: el10
+
+steps:
+  - name: install build deps
+    run: |
+      dnf install -y rpm-build ruby-devel rubygems-devel libvirt-devel \
+        libxml2-devel libxslt-devel gcc make \
+        vagrant rubygem-bundler rubygem-rake rubygem-rspec rubygem-thor \
+        rubygem-rexml rubygem-xml-simple || true
+      gem install diffy fog-libvirt --no-document 2>/dev/null || true
+
+  - name: upload sources
+    upload:
+      src: ../vagrant-libvirt/
+      dest: /tmp/vagrant-libvirt-src/
+      git_archive: "{{branch}}"
+
+  - name: prepare rpmbuild tree
+    run: |
+      mkdir -p ~/rpmbuild/{SOURCES,SPECS}
+      cp /tmp/vagrant-libvirt-src/src/*.patch ~/rpmbuild/SOURCES/ 2>/dev/null || true
+      cp /tmp/vagrant-libvirt-src/src/vagrant-libvirt.spec ~/rpmbuild/SPECS/
+
+  - name: download gem sources
+    run: |
+      cd ~/rpmbuild/SOURCES
+      SPEC=~/rpmbuild/SPECS/vagrant-libvirt.spec
+      GEM_VER=$(grep '^Version:' "$SPEC" | awk '{print $2}')
+      SPEC_COMMIT=$(grep 'vagrant_spec_commit' "$SPEC" | head -1 | awk '{print $NF}')
+      [ -f "vagrant-libvirt-${GEM_VER}.gem" ] || \
+        curl -LO "https://rubygems.org/gems/vagrant-libvirt-${GEM_VER}.gem"
+      [ -f "vagrant-spec-${SPEC_COMMIT}.tar.gz" ] || \
+        curl -LO "https://github.com/mitchellh/vagrant-spec/archive/${SPEC_COMMIT}/vagrant-spec-${SPEC_COMMIT}.tar.gz"
+
+  - name: build RPM
+    run: |
+      cd ~/rpmbuild
+      rpmbuild -ba --nocheck --nodeps SPECS/vagrant-libvirt.spec 2>&1
+      echo "=== Build complete ==="
+      ls -la ~/rpmbuild/RPMS/noarch/ 2>/dev/null || ls -la ~/rpmbuild/RPMS/*/
