@@ -11,5 +11,8 @@ proto/*.pb.go
 # RPM files
 *.rpm
 
+# Logs
+logs/
+
 # Go
 vendor/
