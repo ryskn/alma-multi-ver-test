@@ -23,6 +23,7 @@ Vagrant.configure("2") do |config|
       node.vm.provider "libvirt" do |lv|
         lv.memory = 2048
         lv.cpus   = 2
+        lv.nested = true
         lv.qemu_use_session = false
         lv.management_network_name = "default"
         lv.management_network_address = "192.168.121.0/24"
