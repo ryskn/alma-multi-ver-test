@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,17 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"gopkg.in/yaml.v3"
+)
+
+// ANSI colors
+const (
+	colorReset  = "\033[0m"
+	colorBold   = "\033[1m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorCyan   = "\033[36m"
+	colorDim    = "\033[2m"
 )
 
 var targets = []struct {
@@ -129,6 +141,23 @@ type UploadSpec struct {
 	GitArchive string `yaml:"git_archive"`
 }
 
+// targetLog holds per-target log writer
+type targetLog struct {
+	file *os.File
+}
+
+func (tl *targetLog) Write(s string) {
+	if tl.file != nil {
+		tl.file.WriteString(s)
+	}
+}
+
+func (tl *targetLog) Close() {
+	if tl.file != nil {
+		tl.file.Close()
+	}
+}
+
 func expandVars(s string, vars map[string]string) string {
 	for k, v := range vars {
 		s = strings.ReplaceAll(s, "{{"+k+"}}", v)
@@ -157,10 +186,10 @@ func resolveTargets(names []string) []struct{ Name, Addr string } {
 
 const uploadChunkSize = 64 * 1024
 
-func uploadFile(ctx context.Context, client pb.AgentClient, data []byte, dest string, isTar bool) error {
+func uploadFile(ctx context.Context, client pb.AgentClient, data []byte, dest string, isTar bool) (int64, error) {
 	stream, err := client.Upload(ctx)
 	if err != nil {
-		return fmt.Errorf("open upload stream: %w", err)
+		return 0, fmt.Errorf("open upload stream: %w", err)
 	}
 
 	for i := 0; i < len(data); i += uploadChunkSize {
@@ -176,59 +205,66 @@ func uploadFile(ctx context.Context, client pb.AgentClient, data []byte, dest st
 			chunk.IsTar = isTar
 		}
 		if err := stream.Send(chunk); err != nil {
-			return fmt.Errorf("send chunk: %w", err)
+			return 0, fmt.Errorf("send chunk: %w", err)
 		}
 	}
 
 	resp, err := stream.CloseAndRecv()
 	if err != nil {
-		return fmt.Errorf("close upload: %w", err)
+		return 0, fmt.Errorf("close upload: %w", err)
 	}
-	fmt.Printf("    uploaded %d bytes\n", resp.BytesWritten)
-	return nil
+	return resp.BytesWritten, nil
 }
 
-func doUpload(ctx context.Context, client pb.AgentClient, spec *UploadSpec, vars map[string]string) error {
+func doUpload(ctx context.Context, client pb.AgentClient, spec *UploadSpec, vars map[string]string) (int64, error) {
 	src := expandVars(spec.Src, vars)
 	dest := expandVars(spec.Dest, vars)
 
 	if spec.GitArchive != "" {
 		branch := expandVars(spec.GitArchive, vars)
-		// Use git archive to create tar from the source repo
 		prefix := "src/"
 		if strings.HasSuffix(dest, "/") {
-			// extract prefix from dest basename
 		}
 		cmd := exec.CommandContext(ctx, "git", "archive", "--prefix="+prefix, branch)
 		cmd.Dir = src
 		tarData, err := cmd.Output()
 		if err != nil {
-			return fmt.Errorf("git archive %s (branch %s): %w", src, branch, err)
+			return 0, fmt.Errorf("git archive %s (branch %s): %w", src, branch, err)
 		}
 		return uploadFile(ctx, client, tarData, dest, true)
 	}
 
-	// Regular file upload
 	info, err := os.Stat(src)
 	if err != nil {
-		return fmt.Errorf("stat %s: %w", src, err)
+		return 0, fmt.Errorf("stat %s: %w", src, err)
 	}
 
 	if info.IsDir() {
-		// tar the directory
 		cmd := exec.CommandContext(ctx, "tar", "cf", "-", "-C", src, ".")
 		tarData, err := cmd.Output()
 		if err != nil {
-			return fmt.Errorf("tar %s: %w", src, err)
+			return 0, fmt.Errorf("tar %s: %w", src, err)
 		}
 		return uploadFile(ctx, client, tarData, dest, true)
 	}
 
 	data, err := os.ReadFile(src)
 	if err != nil {
-		return fmt.Errorf("read %s: %w", src, err)
+		return 0, fmt.Errorf("read %s: %w", src, err)
 	}
 	return uploadFile(ctx, client, data, dest, false)
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	m := int(d.Minutes())
+	s := int(d.Seconds()) % 60
+	return fmt.Sprintf("%dm%ds", m, s)
 }
 
 func cmdRun(jobFile string) {
@@ -250,19 +286,72 @@ func cmdRun(jobFile string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Job: %s (%d targets, %d steps)\n", job.Name, len(tgts), len(job.Steps))
+	// Create log directory: logs/<job-name>/<timestamp>/
+	timestamp := time.Now().Format("20060102-150405")
+	logDir := filepath.Join("logs", job.Name, timestamp)
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "error creating log dir: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Open per-target log files
+	logs := map[string]*targetLog{}
+	for _, t := range tgts {
+		f, err := os.Create(filepath.Join(logDir, t.Name+".log"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error creating log file: %v\n", err)
+			os.Exit(1)
+		}
+		tl := &targetLog{file: f}
+		logs[t.Name] = tl
+		defer tl.Close()
+		tl.Write(fmt.Sprintf("# Job: %s\n# Target: %s (%s)\n# Started: %s\n\n",
+			job.Name, t.Name, t.Addr, time.Now().Format(time.RFC3339)))
+	}
+
+	jobStart := time.Now()
+
+	// Header
+	fmt.Printf("\n%s%s Job: %s %s\n", colorBold, colorCyan, job.Name, colorReset)
+	fmt.Printf("%s Targets: %s", colorDim, colorReset)
+	for i, t := range tgts {
+		if i > 0 {
+			fmt.Print(", ")
+		}
+		fmt.Print(t.Name)
+	}
+	fmt.Printf("  |  Steps: %d  |  Logs: %s\n\n", len(job.Steps), logDir)
+
+	allPassed := true
 
 	for i, step := range job.Steps {
-		fmt.Printf("\n--- Step %d: %s ---\n", i+1, step.Name)
+		stepStart := time.Now()
+		fmt.Printf("%s%s [%d/%d] %s %s\n", colorBold, colorCyan, i+1, len(job.Steps), step.Name, colorReset)
+
+		type stepResult struct {
+			err     string
+			stdout  string
+			stderr  string
+			exit    int32
+			uploadN int64
+		}
 
 		var wg sync.WaitGroup
 		var mu sync.Mutex
-		failed := false
+		results := map[string]*stepResult{}
 
 		for _, t := range tgts {
 			wg.Add(1)
 			go func(name, addr string) {
 				defer wg.Done()
+
+				res := &stepResult{}
+				mu.Lock()
+				results[name] = res
+				mu.Unlock()
+
+				tlog := logs[name]
+				tlog.Write(fmt.Sprintf("=== Step %d: %s ===\n", i+1, step.Name))
 
 				vars := map[string]string{"target": name}
 				if job.Vars != nil {
@@ -274,9 +363,9 @@ func cmdRun(jobFile string) {
 				client, conn, err := dial(addr)
 				if err != nil {
 					mu.Lock()
-					fmt.Printf("[%s] FAIL: %v\n", name, err)
-					failed = true
+					res.err = fmt.Sprintf("connection failed: %v", err)
 					mu.Unlock()
+					tlog.Write(fmt.Sprintf("FAIL: %v\n\n", err))
 					return
 				}
 				defer conn.Close()
@@ -285,60 +374,124 @@ func cmdRun(jobFile string) {
 				defer cancel()
 
 				if step.Upload != nil {
-					fmt.Printf("[%s] uploading...\n", name)
-					if err := doUpload(ctx, client, step.Upload, vars); err != nil {
+					n, err := doUpload(ctx, client, step.Upload, vars)
+					if err != nil {
 						mu.Lock()
-						fmt.Printf("[%s] UPLOAD FAIL: %v\n", name, err)
-						failed = true
+						res.err = fmt.Sprintf("upload failed: %v", err)
 						mu.Unlock()
+						tlog.Write(fmt.Sprintf("UPLOAD FAIL: %v\n\n", err))
 						return
 					}
-					fmt.Printf("[%s] upload OK\n", name)
+					mu.Lock()
+					res.uploadN = n
+					mu.Unlock()
+					tlog.Write(fmt.Sprintf("Uploaded %d bytes\n", n))
 				}
 
 				if step.Run != "" {
 					script := expandVars(step.Run, vars)
+					tlog.Write(fmt.Sprintf("$ %s\n", strings.Split(strings.TrimSpace(script), "\n")[0]))
 					resp, err := client.ExecScript(ctx, &pb.ExecRequest{
 						ScriptName: step.Name,
 						ScriptBody: script,
 					})
 					if err != nil {
 						mu.Lock()
-						fmt.Printf("[%s] EXEC FAIL: %v\n", name, err)
-						failed = true
+						res.err = fmt.Sprintf("exec failed: %v", err)
 						mu.Unlock()
+						tlog.Write(fmt.Sprintf("EXEC FAIL: %v\n\n", err))
 						return
 					}
 
 					mu.Lock()
-					fmt.Printf("[%s] exit=%d\n", name, resp.ExitCode)
+					res.stdout = resp.Stdout
+					res.stderr = resp.Stderr
+					res.exit = resp.ExitCode
+					mu.Unlock()
+
+					// Write full output to log
 					if resp.Stdout != "" {
-						// Indent output
-						for _, line := range strings.Split(strings.TrimRight(resp.Stdout, "\n"), "\n") {
-							fmt.Printf("[%s]   %s\n", name, line)
-						}
+						tlog.Write(resp.Stdout)
 					}
 					if resp.Stderr != "" {
-						for _, line := range strings.Split(strings.TrimRight(resp.Stderr, "\n"), "\n") {
-							fmt.Printf("[%s]   (stderr) %s\n", name, line)
-						}
+						tlog.Write("--- stderr ---\n")
+						tlog.Write(resp.Stderr)
 					}
+					tlog.Write(fmt.Sprintf("--- exit: %d ---\n\n", resp.ExitCode))
+
 					if resp.ExitCode != 0 {
-						failed = true
+						mu.Lock()
+						res.err = fmt.Sprintf("exit %d", resp.ExitCode)
+						mu.Unlock()
+						return
 					}
-					mu.Unlock()
 				}
 			}(t.Name, t.Addr)
 		}
 		wg.Wait()
 
-		if failed {
-			fmt.Printf("\n!!! Step %d failed on one or more targets. Stopping.\n", i+1)
+		stepDur := time.Since(stepStart)
+
+		// Print results for this step
+		stepFailed := false
+		for _, t := range tgts {
+			res := results[t.Name]
+			if res.err != "" {
+				stepFailed = true
+				fmt.Printf("  %s%s %-8s FAIL%s  %s\n", colorBold, colorRed, t.Name, colorReset, res.err)
+				// Show last few lines of output for failed targets
+				output := res.stdout + res.stderr
+				if output != "" {
+					lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+					start := 0
+					if len(lines) > 5 {
+						start = len(lines) - 5
+					}
+					for _, line := range lines[start:] {
+						fmt.Printf("  %s  %s  %s%s\n", colorDim, t.Name, line, colorReset)
+					}
+				}
+			} else {
+				fmt.Printf("  %s%s %-8s OK%s", colorBold, colorGreen, t.Name, colorReset)
+				if res.uploadN > 0 {
+					fmt.Printf("    %s%d bytes uploaded%s", colorDim, res.uploadN, colorReset)
+				}
+				// Show last few lines of stdout as summary
+				if res.stdout != "" {
+					lines := strings.Split(strings.TrimRight(res.stdout, "\n"), "\n")
+					start := 0
+					if len(lines) > 3 {
+						start = len(lines) - 3
+					}
+					for _, line := range lines[start:] {
+						trimmed := strings.TrimSpace(line)
+						if trimmed != "" {
+							fmt.Printf("\n  %s  %s  %s%s", colorDim, t.Name, trimmed, colorReset)
+						}
+					}
+				}
+				fmt.Println()
+			}
+		}
+		fmt.Printf("  %s(%s)%s\n\n", colorDim, formatDuration(stepDur), colorReset)
+
+		if stepFailed {
+			allPassed = false
+			fmt.Printf("%s%s Step %d failed. Stopping.%s\n", colorBold, colorRed, i+1, colorReset)
+			fmt.Printf("%sLogs: %s%s\n", colorDim, logDir, colorReset)
 			os.Exit(1)
 		}
 	}
 
-	fmt.Printf("\nJob %q completed successfully.\n", job.Name)
+	totalDur := time.Since(jobStart)
+
+	// Summary
+	if allPassed {
+		fmt.Printf("%s%s All %d steps passed%s %s(%s)%s\n",
+			colorBold, colorGreen, len(job.Steps), colorReset,
+			colorDim, formatDuration(totalDur), colorReset)
+	}
+	fmt.Printf("%sLogs: %s%s\n", colorDim, logDir, colorReset)
 }
 
 // --- main ---
@@ -372,4 +525,3 @@ func main() {
 		os.Exit(1)
 	}
 }
-
