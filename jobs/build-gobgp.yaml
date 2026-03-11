@@ -1,0 +1,81 @@
+name: build-gobgp
+
+steps:
+  - name: install build deps
+    run: |
+      dnf install -y golang git systemd-rpm-macros rpm-build || true
+
+  - name: upload sources
+    upload:
+      src: ../GoBGP/
+      dest: /tmp/gobgp-src/
+      git_archive: main
+
+  - name: prepare rpmbuild tree
+    run: |
+      mkdir -p ~/rpmbuild/{SOURCES,SPECS,BUILD,RPMS,SRPMS}
+      cp /tmp/gobgp-src/src/SPECS/GoBGP.spec ~/rpmbuild/SPECS/
+      cp /tmp/gobgp-src/src/SOURCES/gobgpd.conf ~/rpmbuild/SOURCES/
+
+  - name: download source tarball
+    run: |
+      cd ~/rpmbuild/SOURCES
+      VER=$(grep '^Version:' ~/rpmbuild/SPECS/GoBGP.spec | awk '{print $2}')
+      echo "Version: $VER"
+      rm -f "v${VER}.tar.gz"
+      curl -L -o "v${VER}.tar.gz" \
+        "https://github.com/osrg/gobgp/archive/refs/tags/v${VER}.tar.gz"
+      ls -la "v${VER}.tar.gz"
+      file "v${VER}.tar.gz"
+
+  - name: build RPM
+    run: |
+      export HOME=/root
+      rpmbuild -ba --nocheck --nodeps \
+        --define "_topdir /root/rpmbuild" \
+        /root/rpmbuild/SPECS/GoBGP.spec 2>&1
+      echo "=== Build complete ==="
+      find /root/rpmbuild/RPMS -name '*.rpm' -ls
+
+  - name: install RPM
+    run: |
+      RPM=$(find /root/rpmbuild/RPMS -name 'gobgp-*.rpm' ! -name '*debug*' 2>/dev/null | head -1)
+      if [ -z "$RPM" ]; then
+        echo "ERROR: gobgp RPM not found"
+        exit 1
+      fi
+      echo "Installing: $RPM"
+      rpm -Uvh --nodeps --force "$RPM"
+      rpm -qi gobgp
+
+  - name: test gobgp
+    run: |
+      echo "=== gobgp version ==="
+      gobgp --version || gobgp -v || true
+
+      echo ""
+      echo "=== gobgpd version ==="
+      gobgpd --version || gobgpd -v || true
+
+      echo ""
+      echo "=== systemd unit ==="
+      systemctl cat gobgpd.service
+
+      echo ""
+      echo "=== start gobgpd ==="
+      systemctl start gobgpd
+      sleep 2
+      systemctl is-active gobgpd
+
+      echo ""
+      echo "=== gobgp global ==="
+      gobgp global
+
+      echo ""
+      echo "=== gobgp neighbor ==="
+      gobgp neighbor
+
+      echo ""
+      echo "=== cleanup ==="
+      systemctl stop gobgpd
+      echo "TEST PASSED: gobgpd started and responded to CLI"
