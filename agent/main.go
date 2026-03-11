@@ -38,6 +38,10 @@ func (s *agentServer) ExecScript(ctx context.Context, req *pb.ExecRequest) (*pb.
 	tmp.Close()
 
 	cmd := exec.CommandContext(ctx, "/bin/bash", tmp.Name())
+	cmd.Env = append(os.Environ(),
+		"HOME=/root",
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	)
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
