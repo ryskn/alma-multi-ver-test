@@ -8,6 +8,8 @@ option go_package = "github.com/ryosuke/alma/proto";
 service Agent {
   // Execute a shell script and return the result.
   rpc ExecScript(ExecRequest) returns (ExecResponse);
+  // Execute a shell script and stream output lines.
+  rpc ExecStream(ExecRequest) returns (stream ExecOutput);
   // Upload a file or tar archive to the VM.
   rpc Upload(stream UploadChunk) returns (UploadResponse);
   // Check agent health.
@@ -30,6 +32,13 @@ message PingRequest {}
 message PingResponse {
   string hostname = 1;
   string os_info  = 2;
+}
+
+message ExecOutput {
+  string line      = 1;
+  bool   is_stderr = 2;
+  bool   done      = 3;
+  int32  exit_code = 4;
 }
 
 message UploadChunk {

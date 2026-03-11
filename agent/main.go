@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	pb "github.com/ryosuke/alma/proto"
 	"google.golang.org/grpc"
@@ -60,6 +62,78 @@ func (s *agentServer) ExecScript(ctx context.Context, req *pb.ExecRequest) (*pb.
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
 	}, nil
+}
+
+func (s *agentServer) ExecStream(req *pb.ExecRequest, stream grpc.ServerStreamingServer[pb.ExecOutput]) error {
+	log.Printf("ExecStream: %s (%d bytes)", req.ScriptName, len(req.ScriptBody))
+
+	tmp, err := os.CreateTemp("", "alma-*.sh")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.WriteString(req.ScriptBody); err != nil {
+		return fmt.Errorf("write script: %w", err)
+	}
+	tmp.Close()
+
+	cmd := exec.Command("/bin/bash", tmp.Name())
+	cmd.Env = append(os.Environ(),
+		"HOME=/root",
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	)
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Stream stdout
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stdoutPipe)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		for scanner.Scan() {
+			stream.Send(&pb.ExecOutput{Line: scanner.Text(), IsStderr: false})
+		}
+	}()
+
+	// Stream stderr
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderrPipe)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		for scanner.Scan() {
+			stream.Send(&pb.ExecOutput{Line: scanner.Text(), IsStderr: true})
+		}
+	}()
+
+	wg.Wait()
+
+	exitCode := int32(0)
+	if err := cmd.Wait(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = int32(exitErr.ExitCode())
+		} else {
+			return fmt.Errorf("wait: %w", err)
+		}
+	}
+
+	// Send final message with exit code
+	stream.Send(&pb.ExecOutput{Done: true, ExitCode: exitCode})
+	return nil
 }
 
 func (s *agentServer) Upload(stream grpc.ClientStreamingServer[pb.UploadChunk, pb.UploadResponse]) error {

@@ -27,6 +27,9 @@ const (
 	colorDim    = "\033[2m"
 )
 
+// Verbosity level: 0=quiet, 1=summary(3 lines), 2=full stdout, 3=full stdout+stderr
+var verbosity int
+
 var targets = []struct {
 	Name string
 	Addr string
@@ -255,6 +258,19 @@ func doUpload(ctx context.Context, client pb.AgentClient, spec *UploadSpec, vars
 	return uploadFile(ctx, client, data, dest, false)
 }
 
+func printPrefixed(name, output string, isStderr bool) {
+	if output == "" {
+		return
+	}
+	prefix := colorDim
+	if isStderr {
+		prefix = colorYellow
+	}
+	for _, line := range strings.Split(strings.TrimRight(output, "\n"), "\n") {
+		fmt.Printf("  %s  %s  %s%s\n", prefix, name, line, colorReset)
+	}
+}
+
 func formatDuration(d time.Duration) string {
 	if d < time.Second {
 		return fmt.Sprintf("%dms", d.Milliseconds())
@@ -391,7 +407,8 @@ func cmdRun(jobFile string) {
 				if step.Run != "" {
 					script := expandVars(step.Run, vars)
 					tlog.Write(fmt.Sprintf("$ %s\n", strings.Split(strings.TrimSpace(script), "\n")[0]))
-					resp, err := client.ExecScript(ctx, &pb.ExecRequest{
+
+					stream, err := client.ExecStream(ctx, &pb.ExecRequest{
 						ScriptName: step.Name,
 						ScriptBody: script,
 					})
@@ -403,25 +420,53 @@ func cmdRun(jobFile string) {
 						return
 					}
 
+					var stdoutBuf, stderrBuf strings.Builder
+					var exitCode int32
+
+					for {
+						out, err := stream.Recv()
+						if err != nil {
+							break
+						}
+						if out.Done {
+							exitCode = out.ExitCode
+							break
+						}
+
+						// Write to log
+						tlog.Write(out.Line + "\n")
+
+						// Collect for summary
+						if out.IsStderr {
+							stderrBuf.WriteString(out.Line + "\n")
+							tlog.Write("")
+						} else {
+							stdoutBuf.WriteString(out.Line + "\n")
+						}
+
+						// Real-time output based on verbosity
+						if out.IsStderr && verbosity >= 3 {
+							mu.Lock()
+							fmt.Printf("  %s  %s  %s%s\n", colorYellow, name, out.Line, colorReset)
+							mu.Unlock()
+						} else if !out.IsStderr && verbosity >= 2 {
+							mu.Lock()
+							fmt.Printf("  %s  %s  %s%s\n", colorDim, name, out.Line, colorReset)
+							mu.Unlock()
+						}
+					}
+
 					mu.Lock()
-					res.stdout = resp.Stdout
-					res.stderr = resp.Stderr
-					res.exit = resp.ExitCode
+					res.stdout = stdoutBuf.String()
+					res.stderr = stderrBuf.String()
+					res.exit = exitCode
 					mu.Unlock()
 
-					// Write full output to log
-					if resp.Stdout != "" {
-						tlog.Write(resp.Stdout)
-					}
-					if resp.Stderr != "" {
-						tlog.Write("--- stderr ---\n")
-						tlog.Write(resp.Stderr)
-					}
-					tlog.Write(fmt.Sprintf("--- exit: %d ---\n\n", resp.ExitCode))
+					tlog.Write(fmt.Sprintf("--- exit: %d ---\n\n", exitCode))
 
-					if resp.ExitCode != 0 {
+					if exitCode != 0 {
 						mu.Lock()
-						res.err = fmt.Sprintf("exit %d", resp.ExitCode)
+						res.err = fmt.Sprintf("exit %d", exitCode)
 						mu.Unlock()
 						return
 					}
@@ -439,7 +484,7 @@ func cmdRun(jobFile string) {
 			if res.err != "" {
 				stepFailed = true
 				fmt.Printf("  %s%s %-8s FAIL%s  %s\n", colorBold, colorRed, t.Name, colorReset, res.err)
-				// Show last few lines of output for failed targets
+				// Always show last 5 lines on failure regardless of verbosity
 				output := res.stdout + res.stderr
 				if output != "" {
 					lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
@@ -456,8 +501,11 @@ func cmdRun(jobFile string) {
 				if res.uploadN > 0 {
 					fmt.Printf("    %s%d bytes uploaded%s", colorDim, res.uploadN, colorReset)
 				}
-				// Show last few lines of stdout as summary
-				if res.stdout != "" {
+				fmt.Println()
+
+				// Post-step summary (skip if already streamed with -vv/-vvv)
+				if verbosity == 1 && res.stdout != "" {
+					// -v: last 3 lines
 					lines := strings.Split(strings.TrimRight(res.stdout, "\n"), "\n")
 					start := 0
 					if len(lines) > 3 {
@@ -466,11 +514,10 @@ func cmdRun(jobFile string) {
 					for _, line := range lines[start:] {
 						trimmed := strings.TrimSpace(line)
 						if trimmed != "" {
-							fmt.Printf("\n  %s  %s  %s%s", colorDim, t.Name, trimmed, colorReset)
+							fmt.Printf("  %s  %s  %s%s\n", colorDim, t.Name, trimmed, colorReset)
 						}
 					}
 				}
-				fmt.Println()
 			}
 		}
 		fmt.Printf("  %s(%s)%s\n\n", colorDim, formatDuration(stepDur), colorReset)
@@ -496,32 +543,62 @@ func cmdRun(jobFile string) {
 
 // --- main ---
 
+func parseVerbosity(args []string) ([]string, int) {
+	v := 0
+	var rest []string
+	for _, arg := range args {
+		switch arg {
+		case "-v":
+			v = 1
+		case "-vv":
+			v = 2
+		case "-vvv":
+			v = 3
+		default:
+			rest = append(rest, arg)
+		}
+	}
+	return rest, v
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: alma-ctl <command> [args]\n")
+		fmt.Fprintf(os.Stderr, "usage: alma-ctl [-v|-vv|-vvv] <command> [args]\n")
 		fmt.Fprintf(os.Stderr, "  ping              check all VMs\n")
 		fmt.Fprintf(os.Stderr, "  exec <script.sh>  run script on all VMs\n")
 		fmt.Fprintf(os.Stderr, "  run  <job.yaml>   run YAML job on targets\n")
+		fmt.Fprintf(os.Stderr, "\nVerbosity:\n")
+		fmt.Fprintf(os.Stderr, "  -v     show last 3 lines of output per target\n")
+		fmt.Fprintf(os.Stderr, "  -vv    show full stdout per target\n")
+		fmt.Fprintf(os.Stderr, "  -vvv   show full stdout + stderr per target\n")
 		os.Exit(1)
 	}
 
-	switch os.Args[1] {
+	args, v := parseVerbosity(os.Args[1:])
+	verbosity = v
+
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "usage: alma-ctl [-v|-vv|-vvv] <command> [args]\n")
+		os.Exit(1)
+	}
+
+	switch args[0] {
 	case "ping":
 		cmdPing()
 	case "exec":
-		if len(os.Args) < 3 {
+		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "usage: alma-ctl exec <script.sh>\n")
 			os.Exit(1)
 		}
-		cmdExec(os.Args[2])
+		cmdExec(args[1])
 	case "run":
-		if len(os.Args) < 3 {
+		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "usage: alma-ctl run <job.yaml>\n")
 			os.Exit(1)
 		}
-		cmdRun(os.Args[2])
+		cmdRun(args[1])
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
 		os.Exit(1)
 	}
 }
