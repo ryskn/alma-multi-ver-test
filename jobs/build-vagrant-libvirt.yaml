@@ -46,3 +46,61 @@ steps:
       rpmbuild -ba --nocheck --nodeps SPECS/vagrant-libvirt.spec 2>&1
       echo "=== Build complete ==="
       ls -la ~/rpmbuild/RPMS/noarch/ 2>/dev/null || ls -la ~/rpmbuild/RPMS/*/
+
+  - name: install RPM and libvirt
+    run: |
+      # Install libvirt + qemu for nested VM test
+      dnf install -y libvirt libvirt-daemon-driver-qemu libvirt-client \
+        qemu-kvm qemu-img 2>&1
+      # Start libvirtd (some versions use virtqemud socket-activated)
+      systemctl enable --now libvirtd 2>/dev/null || \
+        systemctl enable --now virtqemud.socket 2>/dev/null || true
+      # Wait for socket
+      sleep 2
+      virsh version
+
+      # Install built RPM
+      RPM=$(find ~/rpmbuild/RPMS -name 'vagrant-libvirt-0.*.rpm' ! -name '*doc*' 2>/dev/null | head -1)
+      if [ -z "$RPM" ]; then
+        echo "ERROR: vagrant-libvirt RPM not found"
+        exit 1
+      fi
+      echo "Installing: $RPM"
+      rpm -Uvh --nodeps --force "$RPM"
+      rpm -qi vagrant-libvirt
+
+  - name: test libvirt VM creation
+    run: |
+      # Check nested KVM
+      echo "=== KVM support ==="
+      grep -c -E 'vmx|svm' /proc/cpuinfo || echo "no nested virt"
+      ls -l /dev/kvm 2>/dev/null || echo "/dev/kvm not found"
+
+      # Setup default network
+      echo ""
+      echo "=== setup default network ==="
+      virsh net-start default 2>/dev/null || true
+      virsh net-list --all
+
+      # Create and start a test VM with virsh
+      echo ""
+      echo "=== create test VM ==="
+      virsh destroy test-vm 2>/dev/null || true
+      virsh undefine test-vm 2>/dev/null || true
+      printf '%s\n' \
+        "<domain type='kvm'>" \
+        "  <name>test-vm</name>" \
+        "  <memory unit='MiB'>256</memory>" \
+        "  <vcpu>1</vcpu>" \
+        "  <os><type arch='x86_64'>hvm</type></os>" \
+        "</domain>" > /tmp/test-vm.xml
+      virsh define /tmp/test-vm.xml
+      virsh start test-vm
+      echo ""
+      echo "=== virsh list ==="
+      virsh list
+      echo ""
+      echo "=== cleanup ==="
+      virsh destroy test-vm
+      virsh undefine test-vm
+      echo "TEST PASSED: VM created and destroyed successfully"
